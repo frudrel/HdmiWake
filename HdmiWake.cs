@@ -12,7 +12,7 @@ using System.Threading;
 using System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("HdmiWake")]
-[assembly: System.Reflection.AssemblyVersion("1.2.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.3.0.0")]
 
 namespace HdmiWake
 {
@@ -27,6 +27,12 @@ namespace HdmiWake
             if (Array.IndexOf(args, "--now") >= 0)
             {
                 Waker.Run("command line", true);
+                return;
+            }
+            // "HdmiWake.exe --save" records the current layout (modes, positions, main display) and exits.
+            if (Array.IndexOf(args, "--save") >= 0)
+            {
+                Displays.Snapshot("command line");
                 return;
             }
 
@@ -126,10 +132,10 @@ namespace HdmiWake
             var saved = ModeStore.Load();
             foreach (var p in paths)
             {
-                if (!IsExternal(p.targetInfo.outputTechnology)) continue;
-                set.Add(TargetKey(p));
+                if (IsExternal(p.targetInfo.outputTechnology)) set.Add(TargetKey(p));
 
-                // Remember resolution, refresh rate and position so they survive re-activation.
+                // Remember every display's resolution, refresh rate and position (the main display
+                // sits at 0,0) so the whole layout survives re-activation.
                 string monitor = MonitorPath(p), gdi = GdiName(p);
                 var dm = Native.NewDevMode();
                 if (monitor != null && gdi != null && Native.EnumDisplaySettings(gdi, Native.ENUM_CURRENT_SETTINGS, ref dm))
@@ -163,54 +169,80 @@ namespace HdmiWake
             return Native.DisplayConfigGetDeviceInfo(ref req) == 0 && !string.IsNullOrEmpty(req.viewGdiDeviceName) ? req.viewGdiDeviceName : null;
         }
 
-        // Windows picks a default (often 59/60 Hz) mode for a re-activated display; put back the
-        // saved mode, or the highest refresh rate at the current resolution if none was saved.
-        static void RestoreMode(Native.PATH p)
+        // Windows gives a re-activated display a default (often 59/60 Hz) mode and leaves the laptop
+        // as main display. Put back the saved refresh rates, then the saved positions (the main
+        // display is the one at 0,0).
+        static void RestoreLayout(List<Native.PATH> added)
+        {
+            var saved = ModeStore.Load();
+            foreach (var p in added) RestoreRefresh(p, saved);
+            int rc = RestorePositions(saved);
+            Log.Write("  Restore positions: " + (rc == 1 ? "no complete saved layout" : "rc=" + rc));
+        }
+
+        // Saved resolution and refresh rate, or the highest refresh rate at the current resolution.
+        static void RestoreRefresh(Native.PATH p, Dictionary<string, ModeStore.Mode> saved)
         {
             string monitor = MonitorPath(p), gdi = GdiName(p);
             if (gdi == null) return;
             var cur = Native.NewDevMode();
             if (!Native.EnumDisplaySettings(gdi, Native.ENUM_CURRENT_SETTINGS, ref cur)) return;
 
-            ModeStore.Mode want = new ModeStore.Mode();
-            bool hasSaved = monitor != null && ModeStore.Load().TryGetValue(monitor, out want);
-            if (!hasSaved) want = new ModeStore.Mode { W = cur.dmPelsWidth, H = cur.dmPelsHeight };
+            ModeStore.Mode s = new ModeStore.Mode();
+            bool has = monitor != null && saved.TryGetValue(monitor, out s);
+            int w = has ? s.W : cur.dmPelsWidth, h = has ? s.H : cur.dmPelsHeight;
+            int hz = PickRefresh(gdi, w, h, has ? s.Hz : 0);
+            if (hz == 0 || (cur.dmPelsWidth == w && cur.dmPelsHeight == h && cur.dmDisplayFrequency == hz)) return;
 
-            // Pick the saved refresh rate if the monitor still offers it, otherwise the highest one.
+            cur.dmPelsWidth = w;
+            cur.dmPelsHeight = h;
+            cur.dmDisplayFrequency = hz;
+            cur.dmFields = Native.DM_PELSWIDTH | Native.DM_PELSHEIGHT | Native.DM_DISPLAYFREQUENCY;
+            int rc = Native.ChangeDisplaySettingsEx(gdi, ref cur, IntPtr.Zero, Native.CDS_UPDATEREGISTRY, IntPtr.Zero);
+            Log.Write("  Set " + gdi + " to " + w + "x" + h + "@" + hz + (has ? " (saved)" : " (max)") + ": rc=" + rc);
+        }
+
+        // The saved refresh rate if the monitor still offers it at w x h, otherwise the highest; 0 if none.
+        static int PickRefresh(string gdi, int w, int h, int wantHz)
+        {
             int best = 0;
-            bool exact = false;
             var dm = Native.NewDevMode();
             for (int i = 0; Native.EnumDisplaySettings(gdi, i, ref dm); i++)
             {
-                if (dm.dmPelsWidth != want.W || dm.dmPelsHeight != want.H) continue;
-                if (dm.dmDisplayFrequency == want.Hz) exact = true;
+                if (dm.dmPelsWidth != w || dm.dmPelsHeight != h) continue;
+                if (dm.dmDisplayFrequency == wantHz) return wantHz;
                 best = Math.Max(best, dm.dmDisplayFrequency);
             }
-            if (best == 0) return; // resolution no longer offered
-            int hz = exact ? want.Hz : best;
+            return best;
+        }
 
-            bool samePos = !hasSaved || (cur.dmPositionX == want.X && cur.dmPositionY == want.Y);
-            if (cur.dmPelsWidth == want.W && cur.dmPelsHeight == want.H && cur.dmDisplayFrequency == hz && samePos) return;
-
-            cur.dmPelsWidth = want.W;
-            cur.dmPelsHeight = want.H;
-            cur.dmDisplayFrequency = hz;
-            cur.dmFields = Native.DM_PELSWIDTH | Native.DM_PELSHEIGHT | Native.DM_DISPLAYFREQUENCY;
-            if (hasSaved)
+        // Moves every active display to its saved position through its source mode. Returns 0 on
+        // success or nothing to do, 1 when some display has no saved position, else the error code.
+        static int RestorePositions(Dictionary<string, ModeStore.Mode> saved)
+        {
+            Native.PATH[] paths; IntPtr modes; uint numModes;
+            if (!Query(Native.QDC_ONLY_ACTIVE_PATHS, out paths, out modes, out numModes)) return -1;
+            try
             {
-                cur.dmPositionX = want.X;
-                cur.dmPositionY = want.Y;
-                cur.dmFields |= Native.DM_POSITION;
+                bool changed = false;
+                foreach (var p in paths)
+                {
+                    string monitor = MonitorPath(p);
+                    ModeStore.Mode s;
+                    uint idx = p.sourceInfo.modeInfoIdx;
+                    if (monitor == null || !saved.TryGetValue(monitor, out s) || idx >= numModes) return 1;
+                    IntPtr mode = new IntPtr(modes.ToInt64() + idx * Native.MODE_INFO_SIZE);
+                    if (Marshal.ReadInt32(mode, 0) != Native.DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) return 1;
+                    if (Marshal.ReadInt32(mode, Native.SOURCE_MODE_X) == s.X && Marshal.ReadInt32(mode, Native.SOURCE_MODE_Y) == s.Y) continue;
+                    Marshal.WriteInt32(mode, Native.SOURCE_MODE_X, s.X);
+                    Marshal.WriteInt32(mode, Native.SOURCE_MODE_Y, s.Y);
+                    changed = true;
+                }
+                if (!changed) return 0;
+                return Native.SetDisplayConfig((uint)paths.Length, paths, numModes, modes,
+                    Native.SDC_APPLY | Native.SDC_USE_SUPPLIED_DISPLAY_CONFIG | Native.SDC_ALLOW_CHANGES | Native.SDC_SAVE_TO_DATABASE);
             }
-            int rc = Native.ChangeDisplaySettingsEx(gdi, ref cur, IntPtr.Zero, Native.CDS_UPDATEREGISTRY | Native.CDS_NORESET, IntPtr.Zero);
-            if (rc != 0 && hasSaved)
-            {
-                // Saved position may overlap the current layout; keep Windows' placement.
-                cur.dmFields &= ~Native.DM_POSITION;
-                rc = Native.ChangeDisplaySettingsEx(gdi, ref cur, IntPtr.Zero, Native.CDS_UPDATEREGISTRY | Native.CDS_NORESET, IntPtr.Zero);
-            }
-            int rcApply = Native.ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
-            Log.Write("  Set " + gdi + " to " + want.W + "x" + want.H + "@" + hz + (hasSaved ? " (saved)" : " (max)") + ": rc=" + rc + "/" + rcApply);
+            finally { Marshal.FreeHGlobal(modes); }
         }
 
         public static int ActiveCount()
@@ -280,7 +312,7 @@ namespace HdmiWake
                     }
                     else Log.Write("  Activated " + added.Count + " external display(s)");
                     changed = rc == 0;
-                    if (changed) foreach (var p in added) RestoreMode(p);
+                    if (changed) RestoreLayout(added);
                 }
 
                 if (wanted == null) return 0;
@@ -461,6 +493,7 @@ namespace HdmiWake
 
             var menu = new ContextMenuStrip();
             menu.Items.Add("Wake monitor now", null, delegate { Schedule("manual", true, 0); });
+            menu.Items.Add("Save current layout", null, delegate { Displays.Snapshot("manual"); });
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Open log", null, delegate
             {
@@ -587,6 +620,9 @@ namespace HdmiWake
         public const uint DISPLAYCONFIG_PATH_ACTIVE = 0x00000001;
         public const uint MODE_IDX_INVALID = 0xFFFFFFFF;
         public const int MODE_INFO_SIZE = 64; // sizeof(DISPLAYCONFIG_MODE_INFO)
+        public const int DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE = 1;
+        public const int SOURCE_MODE_X = 28;  // DISPLAYCONFIG_MODE_INFO.sourceMode.position.x
+        public const int SOURCE_MODE_Y = 32;  // DISPLAYCONFIG_MODE_INFO.sourceMode.position.y
 
         public const uint DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME = 1;
         public const uint DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME = 2;
