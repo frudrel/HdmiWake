@@ -1,4 +1,4 @@
-// HdmiWake - brings external monitors back after logon, unlock, resume and display-on.
+﻿// HdmiWake - brings external monitors back after logon, unlock, resume and display-on.
 // Windows sometimes drops a connected external monitor from the active layout after resume
 // (laptop-only mode). This app remembers which external outputs were active before sleep or
 // display-off and re-activates them, then re-drives the link with a display mode set.
@@ -12,7 +12,7 @@ using System.Threading;
 using System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("HdmiWake")]
-[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.2.0.0")]
 
 namespace HdmiWake
 {
@@ -123,10 +123,94 @@ namespace HdmiWake
             if (!Query(Native.QDC_ONLY_ACTIVE_PATHS, out paths, out modes, out numModes)) return;
             Marshal.FreeHGlobal(modes);
             var set = new HashSet<string>();
+            var saved = ModeStore.Load();
             foreach (var p in paths)
-                if (IsExternal(p.targetInfo.outputTechnology)) set.Add(TargetKey(p));
+            {
+                if (!IsExternal(p.targetInfo.outputTechnology)) continue;
+                set.Add(TargetKey(p));
+
+                // Remember resolution, refresh rate and position so they survive re-activation.
+                string monitor = MonitorPath(p), gdi = GdiName(p);
+                var dm = Native.NewDevMode();
+                if (monitor != null && gdi != null && Native.EnumDisplaySettings(gdi, Native.ENUM_CURRENT_SETTINGS, ref dm))
+                {
+                    var mode = new ModeStore.Mode { W = dm.dmPelsWidth, H = dm.dmPelsHeight, Hz = dm.dmDisplayFrequency, X = dm.dmPositionX, Y = dm.dmPositionY };
+                    saved[monitor] = mode;
+                }
+            }
+            ModeStore.Save(saved);
             lock (Sync) snapshot = set;
             Log.Write("Snapshot (" + reason + "): " + set.Count + " external display(s) active");
+        }
+
+        static string MonitorPath(Native.PATH p)
+        {
+            var req = new Native.TARGET_DEVICE_NAME();
+            req.header.type = Native.DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+            req.header.size = (uint)Marshal.SizeOf(typeof(Native.TARGET_DEVICE_NAME));
+            req.header.adapterId = p.targetInfo.adapterId;
+            req.header.id = p.targetInfo.id;
+            return Native.DisplayConfigGetDeviceInfo(ref req) == 0 && !string.IsNullOrEmpty(req.monitorDevicePath) ? req.monitorDevicePath : null;
+        }
+
+        static string GdiName(Native.PATH p)
+        {
+            var req = new Native.SOURCE_DEVICE_NAME();
+            req.header.type = Native.DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            req.header.size = (uint)Marshal.SizeOf(typeof(Native.SOURCE_DEVICE_NAME));
+            req.header.adapterId = p.sourceInfo.adapterId;
+            req.header.id = p.sourceInfo.id;
+            return Native.DisplayConfigGetDeviceInfo(ref req) == 0 && !string.IsNullOrEmpty(req.viewGdiDeviceName) ? req.viewGdiDeviceName : null;
+        }
+
+        // Windows picks a default (often 59/60 Hz) mode for a re-activated display; put back the
+        // saved mode, or the highest refresh rate at the current resolution if none was saved.
+        static void RestoreMode(Native.PATH p)
+        {
+            string monitor = MonitorPath(p), gdi = GdiName(p);
+            if (gdi == null) return;
+            var cur = Native.NewDevMode();
+            if (!Native.EnumDisplaySettings(gdi, Native.ENUM_CURRENT_SETTINGS, ref cur)) return;
+
+            ModeStore.Mode want = new ModeStore.Mode();
+            bool hasSaved = monitor != null && ModeStore.Load().TryGetValue(monitor, out want);
+            if (!hasSaved) want = new ModeStore.Mode { W = cur.dmPelsWidth, H = cur.dmPelsHeight };
+
+            // Pick the saved refresh rate if the monitor still offers it, otherwise the highest one.
+            int best = 0;
+            bool exact = false;
+            var dm = Native.NewDevMode();
+            for (int i = 0; Native.EnumDisplaySettings(gdi, i, ref dm); i++)
+            {
+                if (dm.dmPelsWidth != want.W || dm.dmPelsHeight != want.H) continue;
+                if (dm.dmDisplayFrequency == want.Hz) exact = true;
+                best = Math.Max(best, dm.dmDisplayFrequency);
+            }
+            if (best == 0) return; // resolution no longer offered
+            int hz = exact ? want.Hz : best;
+
+            bool samePos = !hasSaved || (cur.dmPositionX == want.X && cur.dmPositionY == want.Y);
+            if (cur.dmPelsWidth == want.W && cur.dmPelsHeight == want.H && cur.dmDisplayFrequency == hz && samePos) return;
+
+            cur.dmPelsWidth = want.W;
+            cur.dmPelsHeight = want.H;
+            cur.dmDisplayFrequency = hz;
+            cur.dmFields = Native.DM_PELSWIDTH | Native.DM_PELSHEIGHT | Native.DM_DISPLAYFREQUENCY;
+            if (hasSaved)
+            {
+                cur.dmPositionX = want.X;
+                cur.dmPositionY = want.Y;
+                cur.dmFields |= Native.DM_POSITION;
+            }
+            int rc = Native.ChangeDisplaySettingsEx(gdi, ref cur, IntPtr.Zero, Native.CDS_UPDATEREGISTRY | Native.CDS_NORESET, IntPtr.Zero);
+            if (rc != 0 && hasSaved)
+            {
+                // Saved position may overlap the current layout; keep Windows' placement.
+                cur.dmFields &= ~Native.DM_POSITION;
+                rc = Native.ChangeDisplaySettingsEx(gdi, ref cur, IntPtr.Zero, Native.CDS_UPDATEREGISTRY | Native.CDS_NORESET, IntPtr.Zero);
+            }
+            int rcApply = Native.ChangeDisplaySettingsEx(null, IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
+            Log.Write("  Set " + gdi + " to " + want.W + "x" + want.H + "@" + hz + (hasSaved ? " (saved)" : " (max)") + ": rc=" + rc + "/" + rcApply);
         }
 
         public static int ActiveCount()
@@ -196,6 +280,7 @@ namespace HdmiWake
                     }
                     else Log.Write("  Activated " + added.Count + " external display(s)");
                     changed = rc == 0;
+                    if (changed) foreach (var p in added) RestoreMode(p);
                 }
 
                 if (wanted == null) return 0;
@@ -226,6 +311,49 @@ namespace HdmiWake
                 if (rc != 122) return false; // ERROR_INSUFFICIENT_BUFFER: layout changed, retry
             }
             return false;
+        }
+    }
+
+    // Last known resolution/refresh/position per monitor, keyed by monitor device path.
+    static class ModeStore
+    {
+        public struct Mode { public int W, H, Hz, X, Y; }
+
+        static readonly string FilePath = Path.Combine(Settings.Dir, "modes.txt");
+        static readonly object Sync = new object();
+
+        public static Dictionary<string, Mode> Load()
+        {
+            var result = new Dictionary<string, Mode>(StringComparer.OrdinalIgnoreCase);
+            lock (Sync)
+            {
+                try
+                {
+                    if (!File.Exists(FilePath)) return result;
+                    foreach (var line in File.ReadAllLines(FilePath))
+                    {
+                        var f = line.Split('|');
+                        int w, h, hz, x, y;
+                        if (f.Length == 6 && int.TryParse(f[1], out w) && int.TryParse(f[2], out h) && int.TryParse(f[3], out hz)
+                            && int.TryParse(f[4], out x) && int.TryParse(f[5], out y))
+                            result[f[0]] = new Mode { W = w, H = h, Hz = hz, X = x, Y = y };
+                    }
+                }
+                catch { }
+            }
+            return result;
+        }
+
+        public static void Save(Dictionary<string, Mode> modes)
+        {
+            var lines = new List<string>();
+            foreach (var kv in modes)
+                lines.Add(kv.Key + "|" + kv.Value.W + "|" + kv.Value.H + "|" + kv.Value.Hz + "|" + kv.Value.X + "|" + kv.Value.Y);
+            lock (Sync)
+            {
+                try { File.WriteAllLines(FilePath, lines.ToArray()); }
+                catch { }
+            }
         }
     }
 
@@ -460,6 +588,17 @@ namespace HdmiWake
         public const uint MODE_IDX_INVALID = 0xFFFFFFFF;
         public const int MODE_INFO_SIZE = 64; // sizeof(DISPLAYCONFIG_MODE_INFO)
 
+        public const uint DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME = 1;
+        public const uint DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME = 2;
+
+        public const int ENUM_CURRENT_SETTINGS = -1;
+        public const int DM_POSITION = 0x00000020;
+        public const int DM_PELSWIDTH = 0x00080000;
+        public const int DM_PELSHEIGHT = 0x00100000;
+        public const int DM_DISPLAYFREQUENCY = 0x00400000;
+        public const uint CDS_UPDATEREGISTRY = 0x00000001;
+        public const uint CDS_NORESET = 0x10000000;
+
         public const uint INPUT_MOUSE = 0;
         public const uint MOUSEEVENTF_MOVE = 0x0001;
 
@@ -492,6 +631,54 @@ namespace HdmiWake
         }
 
         [StructLayout(LayoutKind.Sequential)]
+        public struct DEVICE_INFO_HEADER
+        {
+            public uint type, size;
+            public LUID adapterId;
+            public uint id;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct SOURCE_DEVICE_NAME
+        {
+            public DEVICE_INFO_HEADER header;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string viewGdiDeviceName;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct TARGET_DEVICE_NAME
+        {
+            public DEVICE_INFO_HEADER header;
+            public uint flags, outputTechnology;
+            public ushort edidManufactureId, edidProductCodeId;
+            public uint connectorInstance;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string monitorFriendlyDeviceName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string monitorDevicePath;
+        }
+
+        // DEVMODEW, display variant of the union.
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct DEVMODE
+        {
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+            public short dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;
+            public int dmFields;
+            public int dmPositionX, dmPositionY, dmDisplayOrientation, dmDisplayFixedOutput;
+            public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+            public short dmLogPixels;
+            public int dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+            public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight;
+        }
+
+        public static DEVMODE NewDevMode()
+        {
+            var dm = new DEVMODE();
+            dm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+            return dm;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
         public struct MOUSEINPUT
         {
             public int dx, dy;
@@ -511,6 +698,11 @@ namespace HdmiWake
         [DllImport("user32.dll")] public static extern int GetDisplayConfigBufferSizes(uint flags, out uint numPaths, out uint numModes);
         [DllImport("user32.dll")] public static extern int QueryDisplayConfig(uint flags, ref uint numPaths, [Out] PATH[] paths, ref uint numModes, IntPtr modes, IntPtr topologyId);
         [DllImport("user32.dll")] public static extern int SetDisplayConfig(uint numPaths, [In] PATH[] paths, uint numModes, IntPtr modes, uint flags);
+        [DllImport("user32.dll")] public static extern int DisplayConfigGetDeviceInfo(ref SOURCE_DEVICE_NAME request);
+        [DllImport("user32.dll")] public static extern int DisplayConfigGetDeviceInfo(ref TARGET_DEVICE_NAME request);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool EnumDisplaySettings(string device, int modeNum, ref DEVMODE dm);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int ChangeDisplaySettingsEx(string device, ref DEVMODE dm, IntPtr hwnd, uint flags, IntPtr param);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int ChangeDisplaySettingsEx(string device, IntPtr dm, IntPtr hwnd, uint flags, IntPtr param);
         [DllImport("user32.dll")] public static extern IntPtr RegisterPowerSettingNotification(IntPtr hRecipient, ref Guid guid, int flags);
         [DllImport("user32.dll")] public static extern bool UnregisterPowerSettingNotification(IntPtr handle);
         [DllImport("wtsapi32.dll")] public static extern bool WTSRegisterSessionNotification(IntPtr hWnd, int flags);
