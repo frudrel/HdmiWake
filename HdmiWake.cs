@@ -12,7 +12,7 @@ using System.Threading;
 using System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("HdmiWake")]
-[assembly: System.Reflection.AssemblyVersion("1.3.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.4.0.0")]
 
 namespace HdmiWake
 {
@@ -40,6 +40,7 @@ namespace HdmiWake
             using (var mutex = new Mutex(true, "Local\\HdmiWake.SingleInstance", out created))
             {
                 if (!created) return;
+                Native.SetProcessDPIAware(); // crisp tray icon and menu at display scaling above 100%
                 Application.EnableVisualStyles();
                 Application.Run(new HostForm());
             }
@@ -477,6 +478,69 @@ namespace HdmiWake
         }
     }
 
+    // Monitor glyph from the Windows 11 icon font, white on a dark taskbar and black on a light one,
+    // drawn at the tray's icon size for the current display scaling.
+    static class TrayIcon
+    {
+        const string Glyph = ""; // TVMonitor
+
+        public static Icon Create()
+        {
+            int size = SystemInformation.SmallIconSize.Width;
+            var family = FindFamily("Segoe Fluent Icons") ?? FindFamily("Segoe MDL2 Assets");
+            if (family == null) return SystemIcons.Application;
+
+            using (var bmp = new Bitmap(size, size))
+            using (var g = Graphics.FromImage(bmp))
+            using (var path = new System.Drawing.Drawing2D.GraphicsPath())
+            using (var brush = new SolidBrush(LightTaskbar() ? Color.Black : Color.White))
+            {
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+                path.AddString(Glyph, family, (int)FontStyle.Regular, size, Point.Empty, StringFormat.GenericTypographic);
+
+                // Fit the glyph's outline into the icon box and center it.
+                var b = path.GetBounds();
+                float scale = size * 0.94f / Math.Max(b.Width, b.Height);
+                using (var m = new System.Drawing.Drawing2D.Matrix())
+                {
+                    m.Translate(size / 2f, size / 2f);
+                    m.Scale(scale, scale);
+                    m.Translate(-(b.X + b.Width / 2f), -(b.Y + b.Height / 2f));
+                    path.Transform(m);
+                }
+                g.FillPath(brush, path);
+                return Icon.FromHandle(bmp.GetHicon());
+            }
+        }
+
+        public static void Destroy(Icon icon)
+        {
+            if (icon == null || icon == SystemIcons.Application) return;
+            Native.DestroyIcon(icon.Handle);
+            icon.Dispose();
+        }
+
+        static FontFamily FindFamily(string name)
+        {
+            foreach (var f in FontFamily.Families)
+                if (f.Name.Equals(name, StringComparison.OrdinalIgnoreCase)) return f;
+            return null;
+        }
+
+        static bool LightTaskbar()
+        {
+            try
+            {
+                var v = Microsoft.Win32.Registry.GetValue(
+                    @"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+                    "SystemUsesLightTheme", 0);
+                return v is int && (int)v != 0;
+            }
+            catch { return false; }
+        }
+    }
+
     class HostForm : Form
     {
         readonly NotifyIcon tray;
@@ -502,7 +566,7 @@ namespace HdmiWake
             menu.Items.Add("Exit", null, delegate { Close(); });
 
             tray = new NotifyIcon();
-            tray.Icon = SystemIcons.Application;
+            tray.Icon = TrayIcon.Create();
             tray.Text = "HdmiWake";
             tray.ContextMenuStrip = menu;
             tray.DoubleClick += delegate { Schedule("manual", true, 0); };
@@ -517,6 +581,18 @@ namespace HdmiWake
                 pendingAll = false;
                 ThreadPool.QueueUserWorkItem(delegate { Waker.Run(reason, all); });
             };
+
+            Microsoft.Win32.SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
+        }
+
+        // Redraw the icon when the taskbar switches between light and dark.
+        void OnUserPreferenceChanged(object sender, Microsoft.Win32.UserPreferenceChangedEventArgs e)
+        {
+            if (e.Category != Microsoft.Win32.UserPreferenceCategory.General) return;
+            if (InvokeRequired) { BeginInvoke(new Action(delegate { OnUserPreferenceChanged(sender, e); })); return; }
+            var old = tray.Icon;
+            tray.Icon = TrayIcon.Create();
+            TrayIcon.Destroy(old);
         }
 
         protected override void OnLoad(EventArgs e)
@@ -533,7 +609,9 @@ namespace HdmiWake
         {
             if (powerNotify != IntPtr.Zero) Native.UnregisterPowerSettingNotification(powerNotify);
             Native.WTSUnRegisterSessionNotification(Handle);
+            Microsoft.Win32.SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
             tray.Visible = false;
+            TrayIcon.Destroy(tray.Icon);
             tray.Dispose();
             Log.Write("Exited");
             base.OnFormClosed(e);
@@ -739,6 +817,8 @@ namespace HdmiWake
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool EnumDisplaySettings(string device, int modeNum, ref DEVMODE dm);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int ChangeDisplaySettingsEx(string device, ref DEVMODE dm, IntPtr hwnd, uint flags, IntPtr param);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int ChangeDisplaySettingsEx(string device, IntPtr dm, IntPtr hwnd, uint flags, IntPtr param);
+        [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+        [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr handle);
         [DllImport("user32.dll")] public static extern IntPtr RegisterPowerSettingNotification(IntPtr hRecipient, ref Guid guid, int flags);
         [DllImport("user32.dll")] public static extern bool UnregisterPowerSettingNotification(IntPtr handle);
         [DllImport("wtsapi32.dll")] public static extern bool WTSRegisterSessionNotification(IntPtr hWnd, int flags);
