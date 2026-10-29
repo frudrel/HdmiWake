@@ -12,7 +12,7 @@ using System.Threading;
 using System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("HdmiWake")]
-[assembly: System.Reflection.AssemblyVersion("1.6.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.6.1.0")]
 
 namespace HdmiWake
 {
@@ -499,7 +499,7 @@ namespace HdmiWake
     // drawn at the tray's icon size for the current display scaling.
     static class TrayIcon
     {
-        const string Glyph = "îŸ´"; // TVMonitor
+        static readonly string Glyph = ((char)0xE7F4).ToString(); // TVMonitor (kept as a code so file encoding can't mangle it)
 
         public static Icon Create()
         {
