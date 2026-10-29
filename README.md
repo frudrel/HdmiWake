@@ -14,7 +14,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 
 ## Install
 
-Copies the exe to `%LOCALAPPDATA%\HdmiWake`, adds a Startup shortcut (runs at every logon) and starts it.
+Copies the exe to `%LOCALAPPDATA%\HdmiWake`, registers a Task Scheduler task named `HdmiWake` that starts it right at logon (no admin needed; falls back to a Startup shortcut), and starts it. Run it from your own PowerShell, not from inside a packaged app, which would redirect the install into its private AppData.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install.ps1

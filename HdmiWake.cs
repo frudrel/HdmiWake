@@ -12,7 +12,7 @@ using System.Threading;
 using System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("HdmiWake")]
-[assembly: System.Reflection.AssemblyVersion("1.5.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.6.0.0")]
 
 namespace HdmiWake
 {
@@ -448,7 +448,7 @@ namespace HdmiWake
                 Native.PostMessage(Native.HWND_BROADCAST, Native.WM_SYSCOMMAND,
                     (IntPtr)Native.SC_MONITORPOWER, (IntPtr)(-1));
                 NudgeMouse();
-                Thread.Sleep(1000);
+                Thread.Sleep(300);
 
                 // 2. Re-activate external monitors Windows dropped from the layout. A monitor can take a
                 //    few seconds after resume to report as connected, so retry while any is missing.
@@ -499,7 +499,7 @@ namespace HdmiWake
     // drawn at the tray's icon size for the current display scaling.
     static class TrayIcon
     {
-        const string Glyph = ""; // TVMonitor
+        const string Glyph = "îŸ´"; // TVMonitor
 
         public static Icon Create()
         {
@@ -632,7 +632,9 @@ namespace HdmiWake
             powerNotify = Native.RegisterPowerSettingNotification(Handle, ref guid, Native.DEVICE_NOTIFY_WINDOW_HANDLE);
             Native.WTSRegisterSessionNotification(Handle, Native.NOTIFY_FOR_THIS_SESSION);
             Log.Write("Started");
-            Schedule("logon/start", true, Settings.DelayMs + 2000);
+            // The desktop is already settled when the logon task starts us; a monitor that is still
+            // coming up is handled by the retry loop.
+            Schedule("logon/start", true, 500);
         }
 
         protected override void OnFormClosed(FormClosedEventArgs e)
