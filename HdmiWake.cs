@@ -1,4 +1,4 @@
-﻿// HdmiWake - brings external monitors back after logon, unlock, resume and display-on.
+// HdmiWake - brings external monitors back after logon, unlock, resume and display-on.
 // Windows sometimes drops a connected external monitor from the active layout after resume
 // (laptop-only mode). This app remembers which external outputs were active before sleep or
 // display-off and re-activates them, then re-drives the link with a display mode set.
@@ -12,7 +12,7 @@ using System.Threading;
 using System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("HdmiWake")]
-[assembly: System.Reflection.AssemblyVersion("1.4.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.5.0.0")]
 
 namespace HdmiWake
 {
@@ -124,17 +124,21 @@ namespace HdmiWake
             return tech == 0 || tech == 4 || tech == 5 || tech == 10 || tech == 12;
         }
 
-        public static void Snapshot(string reason)
+        // onlyWithExternal skips layouts with no external monitor, so a monitor Windows just dropped
+        // is never recorded as the user's choice.
+        public static void Snapshot(string reason, bool onlyWithExternal = false)
         {
             Native.PATH[] paths; IntPtr modes; uint numModes;
             if (!Query(Native.QDC_ONLY_ACTIVE_PATHS, out paths, out modes, out numModes)) return;
             Marshal.FreeHGlobal(modes);
             var set = new HashSet<string>();
+            foreach (var p in paths)
+                if (IsExternal(p.targetInfo.outputTechnology)) set.Add(TargetKey(p));
+            if (onlyWithExternal && set.Count == 0) return;
+
             var saved = ModeStore.Load();
             foreach (var p in paths)
             {
-                if (IsExternal(p.targetInfo.outputTechnology)) set.Add(TargetKey(p));
-
                 // Remember every display's resolution, refresh rate and position (the main display
                 // sits at 0,0) so the whole layout survives re-activation.
                 string monitor = MonitorPath(p), gdi = GdiName(p);
@@ -396,6 +400,18 @@ namespace HdmiWake
         static int rerun;          // set when a wake is requested while one is running
         static string rerunReason;
         static bool rerunAll;
+        static long lastDoneTicks;
+
+        // True while a wake runs and for a few seconds after, so its own display changes
+        // aren't mistaken for the user changing the layout.
+        public static bool RecentlyActive
+        {
+            get
+            {
+                return Interlocked.CompareExchange(ref running, 0, 0) == 1 ||
+                       DateTime.UtcNow.Ticks - Interlocked.Read(ref lastDoneTicks) < TimeSpan.FromSeconds(10).Ticks;
+            }
+        }
 
         public static void Run(string reason, bool all)
         {
@@ -417,6 +433,7 @@ namespace HdmiWake
             }
             finally
             {
+                Interlocked.Exchange(ref lastDoneTicks, DateTime.UtcNow.Ticks);
                 Interlocked.Exchange(ref running, 0);
             }
         }
@@ -545,6 +562,8 @@ namespace HdmiWake
     {
         readonly NotifyIcon tray;
         readonly System.Windows.Forms.Timer debounce;
+        readonly System.Windows.Forms.Timer layoutSave;
+        DateTime lastTrigger = DateTime.MinValue;
         string pendingReason = "";
         bool pendingAll;
         int lastDisplayState = -1;
@@ -580,6 +599,17 @@ namespace HdmiWake
                 var all = pendingAll;
                 pendingAll = false;
                 ThreadPool.QueueUserWorkItem(delegate { Waker.Run(reason, all); });
+            };
+
+            // Save the layout a few seconds after the user changes it (main display, refresh rate,
+            // arrangement). Changes around a wake or sleep come from Windows or this app, not the user.
+            layoutSave = new System.Windows.Forms.Timer();
+            layoutSave.Interval = 5000;
+            layoutSave.Tick += delegate
+            {
+                layoutSave.Stop();
+                bool nearWake = debounce.Enabled || Waker.RecentlyActive || DateTime.UtcNow - lastTrigger < TimeSpan.FromSeconds(20);
+                if (!nearWake && lastDisplayState != 0) Displays.Snapshot("layout changed", true);
             };
 
             Microsoft.Win32.SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
@@ -619,6 +649,7 @@ namespace HdmiWake
 
         void Schedule(string reason, bool all, int delayMs)
         {
+            lastTrigger = DateTime.UtcNow;
             pendingReason = reason;
             pendingAll = pendingAll || all;
             debounce.Stop();
@@ -633,7 +664,7 @@ namespace HdmiWake
                 int ev = m.WParam.ToInt32();
                 if (ev == Native.PBT_APMSUSPEND)
                 {
-                    Displays.Snapshot("suspend");
+                    Displays.Snapshot("suspend", true);
                 }
                 else if (ev == Native.PBT_APMRESUMEAUTOMATIC || ev == Native.PBT_APMRESUMESUSPEND)
                 {
@@ -645,17 +676,22 @@ namespace HdmiWake
                     if (setting == Native.GUID_CONSOLE_DISPLAY_STATE)
                     {
                         int state = Marshal.ReadInt32(m.LParam, 20); // 0 off, 1 on, 2 dimmed
-                        if (state == 0 && lastDisplayState != 0) Displays.Snapshot("display off");
+                        if (state == 0 && lastDisplayState != 0) Displays.Snapshot("display off", true);
                         if (state == 1 && lastDisplayState == 0) Schedule("display on", false, Settings.DelayMs);
                         lastDisplayState = state;
                     }
                 }
             }
+            else if (m.Msg == Native.WM_DISPLAYCHANGE)
+            {
+                layoutSave.Stop();
+                layoutSave.Start();
+            }
             else if (m.Msg == Native.WM_WTSSESSION_CHANGE)
             {
                 int ev = m.WParam.ToInt32();
                 if (ev == Native.WTS_SESSION_LOCK)
-                    Displays.Snapshot("lock");
+                    Displays.Snapshot("lock", true);
                 else if (ev == Native.WTS_SESSION_UNLOCK || ev == Native.WTS_SESSION_LOGON || ev == Native.WTS_CONSOLE_CONNECT)
                     Schedule("session " + ev, false, Settings.DelayMs);
             }
@@ -674,6 +710,7 @@ namespace HdmiWake
         public static readonly IntPtr HWND_BROADCAST = (IntPtr)0xFFFF;
         public const int WM_SYSCOMMAND = 0x0112;
         public const int SC_MONITORPOWER = 0xF170;
+        public const int WM_DISPLAYCHANGE = 0x007E;
         public const int WM_POWERBROADCAST = 0x0218;
         public const int PBT_APMSUSPEND = 0x0004;
         public const int PBT_APMRESUMESUSPEND = 0x0007;
