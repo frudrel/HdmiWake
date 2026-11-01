@@ -12,7 +12,7 @@ using System.Threading;
 using System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("HdmiWake")]
-[assembly: System.Reflection.AssemblyVersion("1.6.1.0")]
+[assembly: System.Reflection.AssemblyVersion("1.6.2.0")]
 
 namespace HdmiWake
 {
@@ -301,8 +301,12 @@ namespace HdmiWake
                     list.AddRange(added);
                     const uint flags = Native.SDC_APPLY | Native.SDC_USE_SUPPLIED_DISPLAY_CONFIG |
                                        Native.SDC_ALLOW_CHANGES | Native.SDC_SAVE_TO_DATABASE;
-                    int rc = Native.SetDisplayConfig((uint)list.Count, list.ToArray(), numModes, modes, flags);
-                    if (rc != 0)
+                    int rcLayout = ActivateWithLayout(active, added, modes, numModes, flags);
+                    if (rcLayout > 0) Log.Write("  One-step activate failed: rc=" + rcLayout);
+                    bool oneStep = rcLayout == 0;
+                    int rc = oneStep ? 0 : Native.SetDisplayConfig((uint)list.Count, list.ToArray(), numModes, modes, flags);
+                    if (oneStep) Log.Write("  Activated " + added.Count + " external display(s) with saved layout");
+                    else if (rc != 0)
                     {
                         // Let Windows pick every mode if the existing ones don't fit the new layout.
                         var loose = list.ToArray();
@@ -326,6 +330,61 @@ namespace HdmiWake
                 return missing;
             }
             finally { Marshal.FreeHGlobal(modes); }
+        }
+
+        // Turns monitors on with their saved positions in one change, so Explorer
+        // never sees the laptop as main with the monitor beside it and then a separate main-display
+        // swap (which can trip its auto-hide taskbar check). Returns -1 without a complete saved layout.
+        static int ActivateWithLayout(Native.PATH[] active, List<Native.PATH> added, IntPtr modes, uint numModes, uint flags)
+        {
+            var saved = ModeStore.Load();
+            var paths = new List<Native.PATH>(active);
+            int size = Native.MODE_INFO_SIZE;
+            IntPtr merged = Marshal.AllocHGlobal(((int)numModes + added.Count) * size);
+            try
+            {
+                var existing = new byte[(int)numModes * size];
+                Marshal.Copy(modes, existing, 0, existing.Length);
+                Marshal.Copy(existing, 0, merged, existing.Length);
+
+                foreach (var p in active)
+                {
+                    string monitor = MonitorPath(p);
+                    ModeStore.Mode s;
+                    uint idx = p.sourceInfo.modeInfoIdx;
+                    if (monitor == null || !saved.TryGetValue(monitor, out s) || idx >= numModes) return -1;
+                    IntPtr mode = new IntPtr(merged.ToInt64() + idx * size);
+                    if (Marshal.ReadInt32(mode, 0) != Native.DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) return -1;
+                    Marshal.WriteInt32(mode, Native.SOURCE_MODE_X, s.X);
+                    Marshal.WriteInt32(mode, Native.SOURCE_MODE_Y, s.Y);
+                }
+
+                uint next = numModes;
+                foreach (var a in added)
+                {
+                    var p = a;
+                    string monitor = MonitorPath(p);
+                    ModeStore.Mode s;
+                    if (monitor == null || !saved.TryGetValue(monitor, out s)) return -1;
+
+                    IntPtr mode = new IntPtr(merged.ToInt64() + next * size);
+                    Marshal.Copy(new byte[size], 0, mode, size);
+                    Marshal.WriteInt32(mode, 0, Native.DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE);
+                    Marshal.WriteInt32(mode, 4, (int)p.sourceInfo.id);
+                    Marshal.WriteInt32(mode, 8, (int)p.sourceInfo.adapterId.LowPart);
+                    Marshal.WriteInt32(mode, 12, p.sourceInfo.adapterId.HighPart);
+                    Marshal.WriteInt32(mode, 16, s.W);
+                    Marshal.WriteInt32(mode, 20, s.H);
+                    Marshal.WriteInt32(mode, 24, Native.DISPLAYCONFIG_PIXELFORMAT_32BPP);
+                    Marshal.WriteInt32(mode, Native.SOURCE_MODE_X, s.X);
+                    Marshal.WriteInt32(mode, Native.SOURCE_MODE_Y, s.Y);
+
+                    p.sourceInfo.modeInfoIdx = next++;
+                    paths.Add(p);
+                }
+                return Native.SetDisplayConfig((uint)paths.Count, paths.ToArray(), next, merged, flags);
+            }
+            finally { Marshal.FreeHGlobal(merged); }
         }
 
         static bool Query(uint flags, out Native.PATH[] paths, out IntPtr modes, out uint numModes)
@@ -738,6 +797,7 @@ namespace HdmiWake
         public const uint MODE_IDX_INVALID = 0xFFFFFFFF;
         public const int MODE_INFO_SIZE = 64; // sizeof(DISPLAYCONFIG_MODE_INFO)
         public const int DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE = 1;
+        public const int DISPLAYCONFIG_PIXELFORMAT_32BPP = 4;
         public const int SOURCE_MODE_X = 28;  // DISPLAYCONFIG_MODE_INFO.sourceMode.position.x
         public const int SOURCE_MODE_Y = 32;  // DISPLAYCONFIG_MODE_INFO.sourceMode.position.y
 
