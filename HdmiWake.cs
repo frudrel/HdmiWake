@@ -12,7 +12,7 @@ using System.Threading;
 using System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("HdmiWake")]
-[assembly: System.Reflection.AssemblyVersion("1.6.2.0")]
+[assembly: System.Reflection.AssemblyVersion("1.6.3.0")]
 
 namespace HdmiWake
 {
@@ -203,7 +203,14 @@ namespace HdmiWake
             cur.dmPelsHeight = h;
             cur.dmDisplayFrequency = hz;
             cur.dmFields = Native.DM_PELSWIDTH | Native.DM_PELSHEIGHT | Native.DM_DISPLAYFREQUENCY;
-            int rc = Native.ChangeDisplaySettingsEx(gdi, ref cur, IntPtr.Zero, Native.CDS_UPDATEREGISTRY, IntPtr.Zero);
+            // Can fail while the display is switching off or the driver is still settling; retry briefly.
+            int rc = -1;
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                if (attempt > 0) Thread.Sleep(1000);
+                rc = Native.ChangeDisplaySettingsEx(gdi, ref cur, IntPtr.Zero, Native.CDS_UPDATEREGISTRY, IntPtr.Zero);
+                if (rc == 0) break;
+            }
             Log.Write("  Set " + gdi + " to " + w + "x" + h + "@" + hz + (has ? " (saved)" : " (max)") + ": rc=" + rc);
         }
 
@@ -667,8 +674,8 @@ namespace HdmiWake
             layoutSave.Tick += delegate
             {
                 layoutSave.Stop();
-                bool nearWake = debounce.Enabled || Waker.RecentlyActive || DateTime.UtcNow - lastTrigger < TimeSpan.FromSeconds(20);
-                if (!nearWake && lastDisplayState != 0) Displays.Snapshot("layout changed", true);
+                bool nearWake = DateTime.UtcNow - lastTrigger < TimeSpan.FromSeconds(20);
+                if (!nearWake && lastDisplayState != 0) AutoSnapshot("layout changed");
             };
 
             Microsoft.Win32.SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
@@ -708,6 +715,18 @@ namespace HdmiWake
             base.OnFormClosed(e);
         }
 
+        // Automatic saves skip the moments around a wake: the layout is then half restored (for example
+        // still at Windows' default refresh rate) and must not replace the user's saved one.
+        void AutoSnapshot(string reason)
+        {
+            if (debounce.Enabled || Waker.RecentlyActive)
+            {
+                Log.Write("Snapshot (" + reason + ") skipped: wake in progress");
+                return;
+            }
+            Displays.Snapshot(reason, true);
+        }
+
         void Schedule(string reason, bool all, int delayMs)
         {
             lastTrigger = DateTime.UtcNow;
@@ -725,7 +744,7 @@ namespace HdmiWake
                 int ev = m.WParam.ToInt32();
                 if (ev == Native.PBT_APMSUSPEND)
                 {
-                    Displays.Snapshot("suspend", true);
+                    AutoSnapshot("suspend");
                 }
                 else if (ev == Native.PBT_APMRESUMEAUTOMATIC || ev == Native.PBT_APMRESUMESUSPEND)
                 {
@@ -737,7 +756,7 @@ namespace HdmiWake
                     if (setting == Native.GUID_CONSOLE_DISPLAY_STATE)
                     {
                         int state = Marshal.ReadInt32(m.LParam, 20); // 0 off, 1 on, 2 dimmed
-                        if (state == 0 && lastDisplayState != 0) Displays.Snapshot("display off", true);
+                        if (state == 0 && lastDisplayState != 0) AutoSnapshot("display off");
                         if (state == 1 && lastDisplayState == 0) Schedule("display on", false, Settings.DelayMs);
                         lastDisplayState = state;
                     }
@@ -752,7 +771,7 @@ namespace HdmiWake
             {
                 int ev = m.WParam.ToInt32();
                 if (ev == Native.WTS_SESSION_LOCK)
-                    Displays.Snapshot("lock", true);
+                    AutoSnapshot("lock");
                 else if (ev == Native.WTS_SESSION_UNLOCK || ev == Native.WTS_SESSION_LOGON || ev == Native.WTS_CONSOLE_CONNECT)
                     Schedule("session " + ev, false, Settings.DelayMs);
             }
