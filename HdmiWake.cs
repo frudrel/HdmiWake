@@ -12,7 +12,7 @@ using System.Threading;
 using System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("HdmiWake")]
-[assembly: System.Reflection.AssemblyVersion("1.6.3.0")]
+[assembly: System.Reflection.AssemblyVersion("1.7.0.0")]
 
 namespace HdmiWake
 {
@@ -561,6 +561,61 @@ namespace HdmiWake
         }
     }
 
+    // With auto-hide taskbars on several displays, Explorer sometimes shows "A toolbar is already
+    // hidden on this side of your screen" when the main display moves back after resume. It is
+    // harmless, so close it instead of leaving it waiting for a click.
+    static class TaskbarDialog
+    {
+        const string Text = "auto-hide toolbar";
+
+        // Closes matching dialogs owned by the named process; returns how many were closed.
+        public static int CloseMatching(string processName)
+        {
+            int closed = 0;
+            Native.EnumWindows(delegate(IntPtr h, IntPtr l)
+            {
+                if (!Native.IsWindowVisible(h) || ClassOf(h) != "#32770") return true;
+                uint pid;
+                Native.GetWindowThreadProcessId(h, out pid);
+                if (!IsProcess(pid, processName) || !HasChildText(h, Text)) return true;
+                Native.PostMessage(h, Native.WM_CLOSE, IntPtr.Zero, IntPtr.Zero); // the OK command is ignored; close acts as OK
+                closed++;
+                return true;
+            }, IntPtr.Zero);
+            return closed;
+        }
+
+        static string ClassOf(IntPtr h)
+        {
+            var sb = new System.Text.StringBuilder(64);
+            Native.GetClassName(h, sb, sb.Capacity);
+            return sb.ToString();
+        }
+
+        static bool IsProcess(uint pid, string name)
+        {
+            try
+            {
+                using (var p = System.Diagnostics.Process.GetProcessById((int)pid))
+                    return p.ProcessName.Equals(name, StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
+        }
+
+        static bool HasChildText(IntPtr dialog, string text)
+        {
+            bool found = false;
+            Native.EnumChildWindows(dialog, delegate(IntPtr h, IntPtr l)
+            {
+                var sb = new System.Text.StringBuilder(512);
+                Native.GetWindowText(h, sb, sb.Capacity);
+                if (sb.ToString().IndexOf(text, StringComparison.OrdinalIgnoreCase) >= 0) found = true;
+                return !found;
+            }, IntPtr.Zero);
+            return found;
+        }
+    }
+
     // Monitor glyph from the Windows 11 icon font, white on a dark taskbar and black on a light one,
     // drawn at the tray's icon size for the current display scaling.
     static class TrayIcon
@@ -629,6 +684,8 @@ namespace HdmiWake
         readonly NotifyIcon tray;
         readonly System.Windows.Forms.Timer debounce;
         readonly System.Windows.Forms.Timer layoutSave;
+        readonly System.Windows.Forms.Timer dialogWatch;
+        DateTime dialogWatchUntil = DateTime.MinValue;
         DateTime lastTrigger = DateTime.MinValue;
         string pendingReason = "";
         bool pendingAll;
@@ -676,6 +733,16 @@ namespace HdmiWake
                 layoutSave.Stop();
                 bool nearWake = DateTime.UtcNow - lastTrigger < TimeSpan.FromSeconds(20);
                 if (!nearWake && lastDisplayState != 0) AutoSnapshot("layout changed");
+            };
+
+            // For 30 s after each wake trigger, close Explorer's auto-hide taskbar message if it appears.
+            dialogWatch = new System.Windows.Forms.Timer();
+            dialogWatch.Interval = 500;
+            dialogWatch.Tick += delegate
+            {
+                if (DateTime.UtcNow > dialogWatchUntil) { dialogWatch.Stop(); return; }
+                int closed = TaskbarDialog.CloseMatching("explorer");
+                if (closed > 0) Log.Write("Closed Explorer's auto-hide taskbar message");
             };
 
             Microsoft.Win32.SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
@@ -730,6 +797,8 @@ namespace HdmiWake
         void Schedule(string reason, bool all, int delayMs)
         {
             lastTrigger = DateTime.UtcNow;
+            dialogWatchUntil = lastTrigger.AddSeconds(30);
+            dialogWatch.Start();
             pendingReason = reason;
             pendingAll = pendingAll || all;
             debounce.Stop();
@@ -789,6 +858,7 @@ namespace HdmiWake
     {
         public static readonly IntPtr HWND_BROADCAST = (IntPtr)0xFFFF;
         public const int WM_SYSCOMMAND = 0x0112;
+        public const int WM_CLOSE = 0x0010;
         public const int SC_MONITORPOWER = 0xF170;
         public const int WM_DISPLAYCHANGE = 0x007E;
         public const int WM_POWERBROADCAST = 0x0218;
@@ -935,6 +1005,13 @@ namespace HdmiWake
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool EnumDisplaySettings(string device, int modeNum, ref DEVMODE dm);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int ChangeDisplaySettingsEx(string device, ref DEVMODE dm, IntPtr hwnd, uint flags, IntPtr param);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int ChangeDisplaySettingsEx(string device, IntPtr dm, IntPtr hwnd, uint flags, IntPtr param);
+        public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+        [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+        [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumWindowsProc callback, IntPtr lParam);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder name, int max);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int max);
+        [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
         [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
         [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr handle);
         [DllImport("user32.dll")] public static extern IntPtr RegisterPowerSettingNotification(IntPtr hRecipient, ref Guid guid, int flags);
