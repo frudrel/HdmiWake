@@ -12,7 +12,7 @@ using System.Threading;
 using System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("HdmiWake")]
-[assembly: System.Reflection.AssemblyVersion("1.7.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.7.1.0")]
 
 namespace HdmiWake
 {
@@ -55,6 +55,7 @@ namespace HdmiWake
 
         public static int DelayMs = 2000; // wait after the event before acting
         public static int Retries = 5;    // passes to wait for a monitor that is slow to reappear
+        public static int TaskbarAutoHide = -1; // taskbar auto-hide when the layout was last saved; -1 unknown
 
         public static void Load()
         {
@@ -71,6 +72,7 @@ namespace HdmiWake
                         var val = parts[1].Trim();
                         if (key == "delayms") int.TryParse(val, out DelayMs);
                         else if (key == "retries") int.TryParse(val, out Retries);
+                        else if (key == "taskbarautohide") int.TryParse(val, out TaskbarAutoHide);
                     }
                 }
                 Save();
@@ -82,7 +84,7 @@ namespace HdmiWake
         {
             try
             {
-                File.WriteAllLines(FilePath, new[] { "DelayMs=" + DelayMs, "Retries=" + Retries });
+                File.WriteAllLines(FilePath, new[] { "DelayMs=" + DelayMs, "Retries=" + Retries, "TaskbarAutoHide=" + TaskbarAutoHide });
             }
             catch { }
         }
@@ -151,7 +153,9 @@ namespace HdmiWake
             }
             ModeStore.Save(saved);
             lock (Sync) snapshot = set;
-            Log.Write("Snapshot (" + reason + "): " + set.Count + " external display(s) active");
+            Settings.TaskbarAutoHide = Taskbar.IsAutoHide() ? 1 : 0;
+            Settings.Save();
+            Log.Write("Snapshot (" + reason + "): " + set.Count + " external display(s) active, taskbar auto-hide " + (Settings.TaskbarAutoHide == 1 ? "on" : "off"));
         }
 
         static string MonitorPath(Native.PATH p)
@@ -479,6 +483,8 @@ namespace HdmiWake
             }
         }
 
+        public static bool IsRunning { get { return Interlocked.CompareExchange(ref running, 0, 0) == 1; } }
+
         public static void Run(string reason, bool all)
         {
             if (Interlocked.Exchange(ref running, 1) == 1)
@@ -564,6 +570,34 @@ namespace HdmiWake
     // With auto-hide taskbars on several displays, Explorer sometimes shows "A toolbar is already
     // hidden on this side of your screen" when the main display moves back after resume. It is
     // harmless, so close it instead of leaving it waiting for a click.
+    // Taskbar auto-hide through the documented appbar API (applies to every taskbar on Windows 11).
+    static class Taskbar
+    {
+        const uint ABM_GETSTATE = 4, ABM_SETSTATE = 10;
+        const int ABS_AUTOHIDE = 1;
+
+        public static bool IsAutoHide()
+        {
+            var d = NewData();
+            return ((long)Native.SHAppBarMessage(ABM_GETSTATE, ref d) & ABS_AUTOHIDE) != 0;
+        }
+
+        public static void SetAutoHide(bool on)
+        {
+            var d = NewData();
+            d.lParam = (IntPtr)(on ? ABS_AUTOHIDE : 0);
+            Native.SHAppBarMessage(ABM_SETSTATE, ref d);
+        }
+
+        static Native.APPBARDATA NewData()
+        {
+            var d = new Native.APPBARDATA();
+            d.cbSize = Marshal.SizeOf(typeof(Native.APPBARDATA));
+            d.hWnd = Native.FindWindow("Shell_TrayWnd", null);
+            return d;
+        }
+    }
+
     static class TaskbarDialog
     {
         const string Text = "auto-hide toolbar";
@@ -686,6 +720,7 @@ namespace HdmiWake
         readonly System.Windows.Forms.Timer layoutSave;
         readonly System.Windows.Forms.Timer dialogWatch;
         DateTime dialogWatchUntil = DateTime.MinValue;
+        DateTime lastAutoHideFix = DateTime.MinValue;
         DateTime lastTrigger = DateTime.MinValue;
         string pendingReason = "";
         bool pendingAll;
@@ -743,6 +778,16 @@ namespace HdmiWake
                 if (DateTime.UtcNow > dialogWatchUntil) { dialogWatch.Stop(); return; }
                 int closed = TaskbarDialog.CloseMatching("explorer");
                 if (closed > 0) Log.Write("Closed Explorer's auto-hide taskbar message");
+
+                // Explorer turns auto-hide off when that conflict happens; put it back once the
+                // display restore has finished, at most every 3 s so a settling layout isn't fought.
+                if (Settings.TaskbarAutoHide == 1 && !debounce.Enabled && !Waker.IsRunning && DateTime.UtcNow - lastAutoHideFix > TimeSpan.FromSeconds(3)
+                    && !Taskbar.IsAutoHide())
+                {
+                    lastAutoHideFix = DateTime.UtcNow;
+                    Taskbar.SetAutoHide(true);
+                    Log.Write("Turned taskbar auto-hide back on: " + (Taskbar.IsAutoHide() ? "ok" : "failed"));
+                }
             };
 
             Microsoft.Win32.SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
@@ -1005,6 +1050,21 @@ namespace HdmiWake
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool EnumDisplaySettings(string device, int modeNum, ref DEVMODE dm);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int ChangeDisplaySettingsEx(string device, ref DEVMODE dm, IntPtr hwnd, uint flags, IntPtr param);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int ChangeDisplaySettingsEx(string device, IntPtr dm, IntPtr hwnd, uint flags, IntPtr param);
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RECT { public int left, top, right, bottom; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct APPBARDATA
+        {
+            public int cbSize;
+            public IntPtr hWnd;
+            public uint uCallbackMessage, uEdge;
+            public RECT rc;
+            public IntPtr lParam;
+        }
+
+        [DllImport("shell32.dll")] public static extern IntPtr SHAppBarMessage(uint message, ref APPBARDATA data);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string className, string windowName);
         public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
         [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
         [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumWindowsProc callback, IntPtr lParam);
